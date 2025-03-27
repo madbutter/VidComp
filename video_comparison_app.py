@@ -94,6 +94,24 @@ class VideoPlayer(QWidget):
         self.layout.addWidget(self.video_label, stretch=1)  # Make video label expand
         self.layout.addWidget(self.info_label, stretch=0)  # Keep info label at fixed size
         
+    def get_current_frame(self):
+        """Get the current frame as a QPixmap"""
+        if self.cap and 0 <= self.current_frame < self.total_frames:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
+            ret, frame = self.cap.read()
+            if ret:
+                # Convert the frame from BGR to RGB for display
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_frame.shape
+                bytes_per_line = ch * w
+                
+                # Create QImage from the frame data
+                q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                
+                # Create and return QPixmap
+                return QPixmap.fromImage(q_img)
+        return None
+    
     def load_video(self, filepath):
         if filepath:
             self.cap = cv2.VideoCapture(filepath)
@@ -161,6 +179,116 @@ class VideoPlayer(QWidget):
             QTimer.singleShot(50, lambda: self.show_frame(self.current_frame))
 
 
+class OverlayView(QWidget):
+    """Widget for displaying one video overlaid on another with a draggable divider"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.video1 = None  # Top video
+        self.video2 = None  # Bottom video
+        self.divider_pos = 0.5  # Initial position (50% from left)
+        self.dragging = False
+        self.setMouseTracking(True)
+        
+    def set_videos(self, video1, video2):
+        """Set the two videos to be displayed"""
+        self.video1 = video1
+        self.video2 = video2
+        
+    def paintEvent(self, event):
+        """Handle painting of the overlay view"""
+        if not self.video1 or not self.video2:
+            return
+            
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Get the current frames
+        frame1 = self.video1.get_current_frame()
+        frame2 = self.video2.get_current_frame()
+        
+        if frame1 is None or frame2 is None:
+            return
+            
+        # Calculate dimensions
+        width = self.width()
+        height = self.height()
+        
+        # Scale frames to fit the widget while maintaining aspect ratio
+        scaled_frame1 = frame1.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled_frame2 = frame2.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        
+        # Calculate positions to center the frames
+        x1 = (width - scaled_frame1.width()) // 2
+        y1 = (height - scaled_frame1.height()) // 2
+        x2 = (width - scaled_frame2.width()) // 2
+        y2 = (height - scaled_frame2.height()) // 2
+        
+        # Calculate the actual divider position based on the scaled frame
+        divider_x = x1 + int(scaled_frame1.width() * self.divider_pos)
+        
+        # Draw the frames
+        painter.drawPixmap(x2, y2, scaled_frame2)  # Draw bottom video full size
+        painter.drawPixmap(x1, y1, scaled_frame1, 0, 0, divider_x - x1, height)  # Draw top video up to divider
+        
+        # Draw the divider line
+        pen = QPen(QColor(255, 255, 255))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawLine(divider_x, 0, divider_x, height)
+        
+        # Draw the handle
+        handle_width = 10
+        handle_height = 40
+        handle_x = divider_x - handle_width // 2
+        handle_y = (height - handle_height) // 2
+        
+        # Draw handle background
+        painter.fillRect(handle_x, handle_y, handle_width, handle_height, QColor(255, 255, 255))
+        
+        # Draw handle border
+        painter.setPen(QPen(QColor(0, 0, 0)))
+        painter.drawRect(handle_x, handle_y, handle_width, handle_height)
+        
+    def mousePressEvent(self, event):
+        """Handle mouse press events for dragging"""
+        if event.button() == Qt.LeftButton:
+            # Get the scaled frame dimensions
+            if self.video1 and self.video2:
+                frame1 = self.video1.get_current_frame()
+                if frame1:
+                    scaled_frame1 = frame1.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    x1 = (self.width() - scaled_frame1.width()) // 2
+                    divider_x = x1 + int(scaled_frame1.width() * self.divider_pos)
+                    
+                    handle_width = 10
+                    handle_height = 40
+                    handle_x = divider_x - handle_width // 2
+                    handle_y = (self.height() - handle_height) // 2
+                    
+                    # Check if click is within handle area
+                    if (handle_x <= event.x() <= handle_x + handle_width and 
+                        handle_y <= event.y() <= handle_y + handle_height):
+                        self.dragging = True
+            
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release events"""
+        if event.button() == Qt.LeftButton:
+            self.dragging = False
+            
+    def mouseMoveEvent(self, event):
+        """Handle mouse move events for dragging"""
+        if self.dragging and self.video1:
+            frame1 = self.video1.get_current_frame()
+            if frame1:
+                scaled_frame1 = frame1.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                x1 = (self.width() - scaled_frame1.width()) // 2
+                # Calculate divider position relative to the scaled frame
+                relative_x = event.x() - x1
+                self.divider_pos = max(0.0, min(1.0, relative_x / scaled_frame1.width()))
+                self.update()  # Trigger repaint
+
+
 class VideoComparisonApp(QMainWindow):
     """Main application window for video comparison"""
     
@@ -168,12 +296,14 @@ class VideoComparisonApp(QMainWindow):
         super().__init__()
         self.video_player1 = VideoPlayer()
         self.video_player2 = VideoPlayer()
+        self.overlay_view = OverlayView()
         self.playing = False
         self.looping = False  # Track loop state
         self.play_timer = QTimer()
         self.play_timer.timeout.connect(self.update_frame)
         self.current_frame = 0  # Track current frame directly
         self.preferences_file = "video_preferences.json"
+        self.is_overlay_mode = False  # Track current display mode
         
         self.initUI()
         self.load_preferences()  # Load last played videos
@@ -189,11 +319,18 @@ class VideoComparisonApp(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)  # Add some padding around the edges
         
-        # Create a splitter for the two video players
-        video_splitter = QSplitter(Qt.Horizontal)
-        video_splitter.addWidget(self.video_player1)
-        video_splitter.addWidget(self.video_player2)
-        video_splitter.setSizes([600, 600])  # Equal initial sizing
+        # Create a horizontal layout for side-by-side view
+        self.side_by_side_layout = QHBoxLayout()
+        self.side_by_side_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins
+        self.side_by_side_layout.addWidget(self.video_player1)
+        self.side_by_side_layout.addWidget(self.video_player2)
+        
+        # Create a container widget for side-by-side layout
+        self.side_by_side_container = QWidget()
+        self.side_by_side_container.setLayout(self.side_by_side_layout)
+        
+        # Initially hide the overlay view
+        self.overlay_view.hide()
         
         # Controls layout
         controls_layout = QHBoxLayout()
@@ -221,6 +358,11 @@ class VideoComparisonApp(QMainWindow):
         self.loop_btn.setEnabled(False)
         self.update_loop_icon()  # Set initial icon
         
+        # Mode toggle button
+        self.mode_btn = QPushButton("Switch to Overlay")
+        self.mode_btn.clicked.connect(self.toggle_mode)
+        self.mode_btn.setEnabled(False)
+        
         # Timeline slider
         self.timeline_slider = QSlider(Qt.Horizontal)
         self.timeline_slider.setMinimum(0)
@@ -237,11 +379,13 @@ class VideoComparisonApp(QMainWindow):
         controls_layout.addWidget(self.load_btn2)
         controls_layout.addWidget(self.play_btn)
         controls_layout.addWidget(self.loop_btn)
+        controls_layout.addWidget(self.mode_btn)
         controls_layout.addWidget(self.timeline_slider, stretch=1)  # Make slider expand
         controls_layout.addWidget(self.time_label)
         
         # Add layouts to main layout
-        main_layout.addWidget(video_splitter, stretch=1)  # Make video area expand
+        main_layout.addWidget(self.side_by_side_container, stretch=1)  # Make video area expand
+        main_layout.addWidget(self.overlay_view, stretch=1)  # Add overlay view
         main_layout.addLayout(controls_layout, stretch=0)  # Keep controls at fixed size
         
     def save_preferences(self):
@@ -276,6 +420,7 @@ class VideoComparisonApp(QMainWindow):
                     self.play_btn.setEnabled(True)
                     self.loop_btn.setEnabled(True)
                     self.timeline_slider.setEnabled(True)
+                    self.mode_btn.setEnabled(True)  # Enable mode button when both videos are loaded
                     max_frames = min(self.video_player1.total_frames, self.video_player2.total_frames)
                     self.timeline_slider.setMaximum(max_frames - 1)
                     self.update_time_label(0)
@@ -283,33 +428,30 @@ class VideoComparisonApp(QMainWindow):
             print(f"Error loading preferences: {e}")
     
     def load_video(self, player_num):
+        """Load a video file for the specified player"""
         filepath, _ = QFileDialog.getOpenFileName(
-            self, f"Open Video {player_num}", "", "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*)"
+            self,
+            f"Select Video {player_num}",
+            "",
+            "Video Files (*.mp4 *.avi *.mkv *.mov);;All Files (*.*)"
         )
         
         if filepath:
             if player_num == 1:
-                success = self.video_player1.load_video(filepath)
+                self.video_player1.load_video(filepath)
             else:
-                success = self.video_player2.load_video(filepath)
+                self.video_player2.load_video(filepath)
+                    
+            # Update timeline slider range and enable controls if both videos are loaded
+            if self.video_player1.cap and self.video_player2.cap:
+                min_frames = min(self.video_player1.total_frames, self.video_player2.total_frames)
+                self.timeline_slider.setMaximum(min_frames - 1)
+                self.timeline_slider.setEnabled(True)
+                self.play_btn.setEnabled(True)
+                self.loop_btn.setEnabled(True)
+                self.mode_btn.setEnabled(True)  # Only enable mode button when both videos are loaded
                 
-            if success:
-                # Check if both videos are loaded
-                if self.video_player1.cap is not None and self.video_player2.cap is not None:
-                    # Enable playback controls
-                    self.play_btn.setEnabled(True)
-                    self.loop_btn.setEnabled(True)
-                    self.timeline_slider.setEnabled(True)
-                    
-                    # Set slider maximum to the shorter video's frame count
-                    max_frames = min(self.video_player1.total_frames, self.video_player2.total_frames)
-                    self.timeline_slider.setMaximum(max_frames - 1)
-                    
-                    # Update time label
-                    self.update_time_label(0)
-                    
-                    # Save preferences after successful load
-                    self.save_preferences()
+            self.save_preferences()
     
     def slider_value_changed(self):
         """Handle timeline slider movement"""
@@ -320,6 +462,10 @@ class VideoComparisonApp(QMainWindow):
         self.video_player1.show_frame(self.current_frame)
         self.video_player2.show_frame(self.current_frame)
         self.update_time_label(self.current_frame)
+        
+        # Update overlay view if in overlay mode
+        if self.is_overlay_mode:
+            self.overlay_view.update()
     
     def toggle_play(self):
         """Toggle between play and pause states"""
@@ -392,6 +538,10 @@ class VideoComparisonApp(QMainWindow):
         self.video_player1.show_frame(next_frame)
         self.video_player2.show_frame(next_frame)
         self.update_time_label(next_frame)
+        
+        # Update overlay view if in overlay mode
+        if self.is_overlay_mode:
+            self.overlay_view.update()
     
     def update_time_label(self, frame_num):
         """Update the time display label based on current frame"""
@@ -407,6 +557,33 @@ class VideoComparisonApp(QMainWindow):
             total_ss = int(total_time % 60)
             
             self.time_label.setText(f"{current_mm:02d}:{current_ss:02d} / {total_mm:02d}:{total_ss:02d}")
+    
+    def toggle_mode(self):
+        """Switch between side-by-side and overlay modes"""
+        print("Toggle mode called")  # Debug print
+        self.is_overlay_mode = not self.is_overlay_mode
+        print(f"New mode: {'overlay' if self.is_overlay_mode else 'side-by-side'}")  # Debug print
+        
+        if self.is_overlay_mode:
+            # Switch to overlay mode
+            print("Switching to overlay mode")  # Debug print
+            self.side_by_side_container.hide()
+            self.overlay_view.set_videos(self.video_player1, self.video_player2)
+            self.overlay_view.show()
+            self.mode_btn.setText("Switch to Side-by-Side")
+            # Force an update of the overlay view
+            self.overlay_view.update()
+        else:
+            # Switch to side-by-side mode
+            print("Switching to side-by-side mode")  # Debug print
+            self.overlay_view.hide()
+            self.side_by_side_container.show()
+            self.mode_btn.setText("Switch to Overlay")
+            
+        # Update the layout
+        self.centralWidget().layout().update()
+        # Force a repaint of the entire window
+        self.update()
     
     def closeEvent(self, event):
         """Clean up resources when the application closes"""
